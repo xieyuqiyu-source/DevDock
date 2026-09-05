@@ -1,5 +1,7 @@
 # DevDock · macOS 项目启动器
 
+<img src="assets/AppIcon.png" alt="DevDock 应用图标" width="128">
+
 DevDock 是一个原生 macOS 菜单栏应用：把多个项目放进顶部菜单，点击即可后台启动，在一个窗口里查看服务状态与日志。使用 Swift、SwiftUI、AppKit 和系统进程 API，无第三方运行依赖。
 
 ## 界面
@@ -19,7 +21,7 @@ DevDock 是一个原生 macOS 菜单栏应用：把多个项目放进顶部菜�
 - macOS 13 或更新版本。
 - 构建需要 Swift 5.9+，可以只安装 Xcode Command Line Tools，不要求完整 Xcode。
 - 各业务项目仍需自己的 Go、Node.js、pnpm/npm 和数据库等依赖。DevDock 不替业务项目安装运行环境。
-- 当前打包脚本构建本机架构；本次开发设备为 Apple Silicon。
+- 当前打包脚本构建本机架构：在 x86_64（Intel / AMD）macOS 上生成 x86_64 版本，在 Apple Silicon 上生成 arm64 版本。
 
 ## 启动应用
 
@@ -39,6 +41,16 @@ open dist/DevDock.app
 双击 `dist/DevDock.app` 即可使用，也可以将它拖入“应用程序”。应用常驻菜单栏，不显示 Dock 图标。点击菜单栏的终端图标可展开项目列表；“项目与日志…”打开管理窗口，关闭窗口后服务继续运行。退出应用会停止本次由 DevDock 启动的服务；如果服务停止失败，应用会保留窗口供处理。
 
 这是供本机使用的 ad-hoc 签名构建，没有 Developer ID 签名或 Apple 公证。跨设备分发需要另外签名、公证及按目标架构构建。
+
+### 0.1.2
+
+新增紫色终端与底座应用图标。打包时使用 macOS 自带的 `sips` 和 `iconutil` 生成完整多尺寸 ICNS。
+
+### 0.1.1
+
+菜单栏项目列表增加重启按钮，运行中的项目可直接先停止再启动；启停过程中禁用重启，停止过程中禁用重复停止。
+
+后台启动脚本退出后，最多等待 3 秒确认目标进程，避免 `nohup` 尚未切换到服务程序时误报启动失败。已在 AMD Ryzen 7 5800X / macOS 15.7.7 上验证 x86_64 构建和重启流程。
 
 ## 项目发现与配置
 

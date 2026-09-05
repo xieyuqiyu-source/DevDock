@@ -196,6 +196,16 @@ final class ProjectStore: ObservableObject {
                 }
                 if !command.exited { throw AppError.message("\(unit.name) 的后台启动命令超过 120 秒，可停止后查看日志。") }
                 guard command.exitCode == 0 else { throw AppError.message("\(unit.name) 启动命令退出（\(command.exitCode ?? -1)），请查看启动日志。") }
+                // The launcher can exit before nohup has exec'd the configured daemon.
+                // Keep checking executable ownership; never accept the PID file alone.
+                for _ in 0..<30 {
+                    if let pid = System.ownedPID(project: project, unit: unit) {
+                        registerDaemon(pid, for: unit.id)
+                        break
+                    }
+                    try Task.checkCancellation()
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
                 guard let pid = System.ownedPID(project: project, unit: unit) else {
                     throw AppError.message("\(unit.name) 未找到匹配的后台进程，请检查 PID 文件和可执行文件配置。")
                 }

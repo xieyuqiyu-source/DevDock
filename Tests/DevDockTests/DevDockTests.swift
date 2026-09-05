@@ -60,7 +60,11 @@ final class DevDockTests {
         let log = root.appendingPathComponent("launch.log")
         let command = try RunningCommand(command: "pwd; /bin/sleep 60 & echo CHILD=$!; wait", directory: directory.path,
             environment: ProcessInfo.processInfo.environment, logURL: log, helperURL: helper)
-        try await Task.sleep(nanoseconds: 350_000_000)
+        // Login shell initialization can take longer on different hosts or under build load.
+        for _ in 0..<100 {
+            if tailText(log).contains("CHILD=") || command.exited { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
         try expectFalse(command.exited)
         try equal(getpgid(command.pid), command.pid)
         let content = tailText(log)
@@ -88,13 +92,24 @@ final class DevDockTests {
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         try expectNil(store.notices[project.id])
-        let pid = try unwrap(System.ownedPID(project: project, unit: unit))
+        var pid = try unwrap(System.ownedPID(project: project, unit: unit))
         defer { kill(pid, SIGKILL) }
         try expect(store.isActive(project))
         // A PID file pointing to this test runner must not be treated as the configured daemon.
         try String(getpid()).write(to: pidPath, atomically: true, encoding: .utf8)
         try expectNil(System.ownedPID(project: project, unit: unit))
         try String(pid).write(to: pidPath, atomically: true, encoding: .utf8)
+        let previousPID = pid
+        store.stop(project, restart: true)
+        for _ in 0..<150 {
+            if !store.busy.contains(project.id) { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        pid = try unwrap(System.ownedPID(project: project, unit: unit))
+        try expectNil(store.notices[project.id])
+        try different(pid, previousPID)
+        try expectNil(System.executable(pid: previousPID), "Restart must stop the previous process")
+        try expect(store.isActive(project))
         store.stop(project)
         for _ in 0..<100 {
             if !store.busy.contains(project.id) { break }
@@ -282,7 +297,9 @@ func expectFalse(_ value: Bool) throws { try expect(!value) }
 func equal<T: Equatable>(_ a: T, _ b: T) throws { try expect(a == b, "\(a) != \(b)") }
 func different<T: Equatable>(_ a: T, _ b: T) throws { try expect(a != b) }
 func less<T: Comparable>(_ a: T, _ b: T) throws { try expect(a < b) }
-func expectNil<T>(_ value: T?, _ message: String = "expected nil") throws { try expect(value == nil, message) }
+func expectNil<T>(_ value: T?, _ message: String = "expected nil", file: StaticString = #filePath, line: UInt = #line) throws {
+    try expect(value == nil, "\(message): \(String(describing: value))", file: file, line: line)
+}
 func expectNotNil<T>(_ value: T?) throws { try expect(value != nil) }
 func unwrap<T>(_ value: T?) throws -> T { guard let value else { throw AppError.message("Unexpected nil") }; return value }
 

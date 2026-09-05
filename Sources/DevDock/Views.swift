@@ -103,6 +103,15 @@ struct MenuPanel: View {
                                 }.contentShape(Rectangle())
                             }.buttonStyle(.plain).help("查看 \(project.name) 的状态与日志")
                             if store.busy.contains(project.id) { ProgressView().controlSize(.small) }
+                            if store.isActive(project) || store.busy.contains(project.id) {
+                                Button { store.stop(project, restart: true) } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                        .font(.system(size: 10, weight: .semibold)).frame(width: 18, height: 22)
+                                }.buttonStyle(.bordered).tint(DockStyle.accent)
+                                    .disabled(store.busy.contains(project.id))
+                                    .help("重启项目")
+                                    .accessibilityLabel("重启 \(project.name)")
+                            }
                             Button {
                                 if store.isActive(project) || store.busy.contains(project.id) { store.stop(project) }
                                 else { store.launch(project) }
@@ -110,8 +119,9 @@ struct MenuPanel: View {
                                 Image(systemName: store.isActive(project) || store.busy.contains(project.id) ? "stop.fill" : "play.fill")
                                     .font(.system(size: 10, weight: .semibold)).frame(width: 18, height: 22)
                             }.buttonStyle(.bordered).tint(DockStyle.accent)
-                                .help(store.isActive(project) ? "停止项目" : "启动项目")
-                                .accessibilityLabel(store.isActive(project) ? "停止 \(project.name)" : "启动 \(project.name)")
+                                .disabled(store.phases[project.id] == "正在停止" && store.busy.contains(project.id))
+                                .help(store.isActive(project) || store.busy.contains(project.id) ? "停止项目" : "启动项目")
+                                .accessibilityLabel(store.isActive(project) || store.busy.contains(project.id) ? "停止 \(project.name)" : "启动 \(project.name)")
                         }.padding(.horizontal, 10).padding(.vertical, 10)
                     }
                     if filtered.isEmpty {
