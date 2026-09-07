@@ -132,6 +132,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func captureSmoke() async {
         guard let directory = ProcessInfo.processInfo.environment["DEVDOCK_SCREENSHOT_DIR"], let view = window?.contentView else { return }
+        // Presentation-only fixtures; smoke mode never opens these URLs.
+        let links = [Endpoint(name: "前端页面（布局示例）", url: "http://localhost:15175", healthURL: "http://localhost:15175"),
+                     Endpoint(name: "管理后台（布局示例）", url: "http://localhost:15176/admin", healthURL: "http://localhost:15176")]
+        store.discoveredEndpoints[store.projects[0].units[0].id] = links
+        for link in links { store.endpointStates[link.id] = .listening }
         func write(_ view: NSView, _ name: String) {
             view.layoutSubtreeIfNeeded()
             guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }

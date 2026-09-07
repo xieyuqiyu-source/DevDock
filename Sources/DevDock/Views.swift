@@ -91,6 +91,7 @@ struct MenuPanel: View {
             ScrollView {
                 LazyVStack(spacing: 4) {
                     ForEach(filtered) { project in
+                        VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 10) {
                             Button { openProject(project.id) } label: {
                                 HStack(spacing: 10) {
@@ -122,6 +123,20 @@ struct MenuPanel: View {
                                 .disabled(store.phases[project.id] == "正在停止" && store.busy.contains(project.id))
                                 .help(store.isActive(project) || store.busy.contains(project.id) ? "停止项目" : "启动项目")
                                 .accessibilityLabel(store.isActive(project) || store.busy.contains(project.id) ? "停止 \(project.name)" : "启动 \(project.name)")
+                        }
+                        ForEach(store.browserEndpoints(project)) { endpoint in
+                            if let url = URL(string: endpoint.url) {
+                                Link(destination: url) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "arrow.up.right.square")
+                                        Text(endpoint.name).lineLimit(1)
+                                        Spacer(minLength: 4)
+                                        Text(verbatim: url.port.map { ":" + String($0) } ?? "打开").monospacedDigit()
+                                    }.font(.system(size: 11)).frame(height: 20)
+                                }.help("在浏览器打开 \(endpoint.url)")
+                                    .accessibilityLabel("打开 \(project.name) · \(endpoint.name)，\(endpoint.url)")
+                            }
+                        }
                         }.padding(.horizontal, 10).padding(.vertical, 10)
                     }
                     if filtered.isEmpty {
@@ -129,7 +144,7 @@ struct MenuPanel: View {
                             .font(.callout).foregroundStyle(.secondary).padding(24)
                     }
                 }.padding(.horizontal, 8)
-            }.frame(height: min(360, CGFloat(max(1, filtered.count)) * 66 + 8))
+            }.frame(height: min(360, CGFloat(max(1, filtered.count)) * 66 + CGFloat(filtered.reduce(0) { $0 + store.browserEndpoints($1).count }) * 26 + 8))
             Divider().padding(.top, 8)
             HStack {
                 Button { openProject(nil) } label: { Label("项目与日志", systemImage: "sidebar.left") }.font(.system(size: 12))
@@ -161,7 +176,7 @@ struct MainView: View {
                 }.padding(.horizontal, 18).padding(.top, 24).padding(.bottom, 22)
                 DockSearch(placeholder: "搜索项目", text: $query).padding(.horizontal, 14)
                 HStack {
-                    Text("项目").font(.system(size: 11, weight: .medium))
+                    Text(query.isEmpty ? "项目 · 拖动排序" : "项目 · 清空搜索后排序").font(.system(size: 11, weight: .medium))
                     Spacer()
                     Text(String(store.projects.count)).font(.system(size: 11)).monospacedDigit()
                 }.foregroundStyle(.secondary).padding(.horizontal, 20).padding(.top, 24).padding(.bottom, 8)
@@ -173,7 +188,24 @@ struct MainView: View {
                                 Text(project.name).font(.system(size: 12, weight: .medium)).lineLimit(1).help(project.name)
                                 StatusLabel(text: store.status(project))
                             }
+                            Spacer(minLength: 0)
+                            Image(systemName: "line.3.horizontal").font(.system(size: 10))
+                                .foregroundStyle(.secondary).accessibilityHidden(true)
+                                .help("拖动项目排序；也可右键上移或下移")
                         }.padding(.vertical, 9).tag(project.id).listRowSeparator(.hidden)
+                            .contextMenu {
+                                if let index = store.projects.firstIndex(where: { $0.id == project.id }) {
+                                    Button("上移") { store.moveProjects(from: IndexSet(integer: index), to: index - 1) }
+                                        .disabled(index == 0 || !query.isEmpty)
+                                    Button("下移") { store.moveProjects(from: IndexSet(integer: index), to: index + 2) }
+                                        .disabled(index == store.projects.count - 1 || !query.isEmpty)
+                                }
+                            }
+                            .moveDisabled(!query.isEmpty)
+                    }
+                    .onMove { offsets, destination in
+                        guard query.isEmpty else { return }
+                        store.moveProjects(from: offsets, to: destination)
                     }
                 }.listStyle(.sidebar).scrollContentBackground(.hidden)
                 HStack(spacing: 6) {

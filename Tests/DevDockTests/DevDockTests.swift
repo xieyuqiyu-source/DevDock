@@ -15,6 +15,37 @@ final class DevDockTests {
         URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".build/debug/DevDock")
     }
 
+    func testOrderingAndBrowserEndpoints() throws {
+        let root = try temp()
+        let store = ProjectStore(support: root, seed: false, monitor: false)
+        let projects = ["A", "B", "C"].map { Project(name: $0, path: "/tmp", units: [LaunchUnit(name: "web", command: "true")]) }
+        store.projects = projects
+        store.moveProjects(from: IndexSet(integer: 2), to: 0)
+        try equal(store.projects.map(\.name), ["C", "A", "B"])
+        store.moveProjects(from: IndexSet(integer: 0), to: 3)
+        try equal(store.projects, projects)
+        store.moveProjects(from: IndexSet([0, 2]), to: 3)
+        try equal(store.projects.map(\.name), ["B", "A", "C"])
+        let restored = ProjectStore(support: root, seed: false, monitor: false)
+        try equal(restored.projects, store.projects)
+        let previous = store.projects
+        try FileManager.default.removeItem(at: store.configURL)
+        try FileManager.default.createDirectory(at: store.configURL, withIntermediateDirectories: true)
+        store.moveProjects(from: IndexSet(integer: 0), to: 3)
+        try equal(store.projects, previous)
+        try expectNotNil(store.error)
+        let web = Endpoint(name: "前端", url: "http://localhost:5173/app", healthURL: "http://localhost:5173")
+        let occupied = Endpoint(name: "外部", url: "http://localhost:9999", healthURL: "http://localhost:9999")
+        let remote = Endpoint(name: "非本地", url: "https://example.com", healthURL: "https://example.com")
+        let duplicate = Endpoint(name: "重复", url: web.url, healthURL: web.url)
+        let ipv6 = Endpoint(name: "IPv6", url: "http://[::1]:5174", healthURL: "http://[::1]:5174")
+        store.discoveredEndpoints[projects[0].units[0].id] = [web, occupied, remote, duplicate, ipv6]
+        store.endpointStates = [web.id: .ready, occupied.id: .occupied(123), remote.id: .ready, duplicate.id: .listening, ipv6.id: .listening]
+        try equal(store.browserEndpoints(projects[0]).map(\.id), [web.id, ipv6.id])
+        store.endpointStates = [:]
+        try expect(store.browserEndpoints(projects[0]).isEmpty)
+    }
+
     func testDiscoveryDoesNotExecuteAndSkipsDependencies() throws {
         let root = try temp()
         let project = root.appendingPathComponent("项目 ' $(touch SHOULD_NOT_EXIST)")
@@ -309,6 +340,8 @@ struct Checks {
         let checks = DevDockTests()
         defer { for url in checks.temporary { try? FileManager.default.removeItem(at: url) } }
         do {
+            try checks.testOrderingAndBrowserEndpoints()
+            print("PASS project ordering, persistence rollback and browser endpoint filtering")
             try checks.testDiscoveryDoesNotExecuteAndSkipsDependencies()
             print("PASS discovery is read-only and bounded")
             try checks.testHospitalDiscoverySeparatesAPIsFromWeb()
@@ -329,7 +362,7 @@ struct Checks {
             print("PASS IPv4/IPv6 address ownership, daemon descendants and shared sockets")
             try checks.testBoundedLogsAndANSIConversion()
             print("PASS log rotation, bounded reading and ANSI conversion")
-            print("All 10 checks passed. No business project was started.")
+            print("All 11 checks passed. No business project was started.")
         } catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }
 }

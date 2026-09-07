@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import SwiftUI
 
 @MainActor
 final class ProjectStore: ObservableObject {
@@ -99,6 +100,25 @@ final class ProjectStore: ObservableObject {
         let previous = projects
         projects.removeAll { $0.id == project.id }
         do { try save() } catch { projects = previous; self.error = error.localizedDescription }
+    }
+
+    func moveProjects(from offsets: IndexSet, to destination: Int) {
+        guard offsets.allSatisfy({ projects.indices.contains($0) }),
+              (0...projects.count).contains(destination) else { return }
+        let previous = projects
+        projects.move(fromOffsets: offsets, toOffset: destination)
+        do { try save() } catch { projects = previous; self.error = error.localizedDescription }
+    }
+
+    func browserEndpoints(_ project: Project) -> [Endpoint] {
+        var seen = Set<String>()
+        return project.enabledUnits.flatMap { displayedEndpoints($0) }.filter { endpoint in
+            guard endpointStates[endpoint.id]?.isOwned == true,
+                  let url = URL(string: endpoint.url),
+                  ["http", "https"].contains(url.scheme ?? ""),
+                  ["localhost", "127.0.0.1", "::1", "[::1]"].contains(url.host ?? "") else { return false }
+            return seen.insert(endpoint.url).inserted
+        }
     }
 
     func importFolder() {
