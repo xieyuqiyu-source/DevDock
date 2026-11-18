@@ -6,6 +6,7 @@ import SwiftUI
 final class ProjectStore: ObservableObject {
     @Published var projects: [Project] = []
     @Published var endpointStates: [String: EndpointState] = [:]
+    @Published var endpointActivity: [String: EndpointActivity] = [:]
     @Published var discoveredEndpoints: [UUID: [Endpoint]] = [:]
     @Published var phases: [UUID: String] = [:]
     @Published var notices: [UUID: String] = [:]
@@ -13,6 +14,8 @@ final class ProjectStore: ObservableObject {
     @Published var error: String?
     @Published var revision = 0
     @Published var scanning = false
+    @Published private var external: [UUID: [ProcessIdentity]] = [:]
+    @Published private var observedListeners: [UUID: [ProcessIdentity]] = [:]
 
     let support: URL
     var configURL: URL { support.appendingPathComponent("projects.json") }
@@ -58,7 +61,7 @@ final class ProjectStore: ObservableObject {
         monitor = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(AppConfiguration.processRefreshInterval * 1_000_000_000))
             }
         }
     }
@@ -143,6 +146,12 @@ final class ProjectStore: ObservableObject {
 
     func isActive(_ project: Project) -> Bool { project.units.contains { isActive($0) } }
     func isActive(_ unit: LaunchUnit) -> Bool {
+        canStop(unit) || observedListeners[unit.id]?.isEmpty == false
+    }
+    func canStop(_ unit: LaunchUnit) -> Bool { isManaged(unit) || external[unit.id]?.isEmpty == false }
+    func canStop(_ project: Project) -> Bool { project.units.contains { canStop($0) } }
+    func canRestart(_ project: Project) -> Bool { project.units.allSatisfy { observedListeners[$0.id]?.isEmpty != false } }
+    private func isManaged(_ unit: LaunchUnit) -> Bool {
         if ownedDetached[unit.id] != nil { return true }
         if let command = commands[unit.id] { return !command.exited || kill(-command.pid, 0) == 0 }
         return false
@@ -152,16 +161,22 @@ final class ProjectStore: ObservableObject {
         if busy.contains(project.id) { return phases[project.id] ?? "处理中" }
         if isActive(project) {
             if notices[project.id] != nil { return "需要关注" }
+            if project.enabledUnits.contains(where: { observedListeners[$0.id]?.isEmpty == false }) { return "外部监听" }
+            if project.enabledUnits.contains(where: { external[$0.id]?.isEmpty == false }) { return "外部运行" }
             let endpoints = project.endpoints
             if endpoints.isEmpty { return "运行中" }
             return endpoints.allSatisfy { endpointStates[$0.id] == .ready } ? "已就绪" : "部分服务未就绪"
         }
-        if notices[project.id] != nil { return "启动失败" }
         if project.endpoints.contains(where: { if case .occupied = endpointStates[$0.id] { return true }; return false }) { return "端口被占用" }
+        if notices[project.id] != nil { return "启动失败" }
         return "已停止"
     }
 
     var activeCount: Int { projects.filter { isActive($0) }.count }
+    var hasManagedServices: Bool { projects.contains { $0.units.contains(where: isManaged) } }
+    private var managedRoots: Set<Int32> {
+        Set(commands.values.map(\.pid)).union(ownedDetached.values)
+    }
 
     func launch(_ project: Project, only: UUID? = nil) {
         guard !shuttingDown, !busy.contains(project.id) else { return }
@@ -186,16 +201,32 @@ final class ProjectStore: ObservableObject {
     private func start(_ project: Project, only: UUID?) async throws {
         try project.validate()
         if environment == nil { environment = await System.shellEnvironment() }
+        var foundExternal = false
         for unit in project.enabledUnits where only == nil || unit.id == only {
             try Task.checkCancellation()
-            guard !isActive(unit) else { continue }
+            guard !isManaged(unit) else { continue }
             phases[project.id] = "正在启动 · \(unit.name)"
+            guard let snapshot = await System.processSnapshot() else {
+                throw AppError.message("无法检查现有进程，请稍后重试。")
+            }
+            try Task.checkCancellation()
+            let running = externalProcesses(project, unit, in: snapshot, excluding: managedRoots)
+            let listening = snapshot.externalListeners(project, unit, projects: projects, excluding: managedRoots.union(running.map(\.pid)))
+            if !running.isEmpty || !listening.isEmpty {
+                external[unit.id] = running.isEmpty ? nil : running
+                observedListeners[unit.id] = listening.isEmpty ? nil : listening
+                foundExternal = true
+                continue
+            }
+            external[unit.id] = nil
+            observedListeners[unit.id] = nil
             if unit.detached, System.ownedPID(project: project, unit: unit) != nil {
-                throw AppError.message("\(unit.name) 已在外部运行。请先用项目原有方式停止，再由 DevDock 启动。")
+                throw AppError.message("\(unit.name) 的 PID 文件指向正在运行的进程，但无法确认归属。")
             }
             for endpoint in unit.endpoints {
-                if let port = endpoint.port, let pid = await System.listeningPID(port: port) {
-                    throw AppError.message("\(endpoint.name) 的端口 \(port) 已被 PID \(pid) 占用。现有进程未被修改，请先停止它或修改端口配置。")
+                if case .occupied(let pid) = snapshot.state(for: endpoint, owned: []) {
+                    endpointStates[endpoint.id] = .occupied(pid)
+                    throw AppError.message("\(endpoint.name) 的地址已被 PID \(pid) 占用：\(endpoint.url)。")
                 }
             }
             try Task.checkCancellation()
@@ -207,7 +238,7 @@ final class ProjectStore: ObservableObject {
             for endpoint in unit.endpoints { endpointStates[endpoint.id] = .stopped }
             revision += 1
             if unit.detached {
-                for _ in 0..<1200 {
+                for _ in 0..<AppConfiguration.serviceCheckRetries {
                     // Register a daemon even if the user clicked Stop while its build was running.
                     if let pid = System.ownedPID(project: project, unit: unit) { registerDaemon(pid, for: unit.id) }
                     try Task.checkCancellation()
@@ -218,7 +249,7 @@ final class ProjectStore: ObservableObject {
                 guard command.exitCode == 0 else { throw AppError.message("\(unit.name) 启动命令退出（\(command.exitCode ?? -1)），请查看启动日志。") }
                 // The launcher can exit before nohup has exec'd the configured daemon.
                 // Keep checking executable ownership; never accept the PID file alone.
-                for _ in 0..<30 {
+                for _ in 0..<AppConfiguration.daemonLaunchCheckRetries {
                     if let pid = System.ownedPID(project: project, unit: unit) {
                         registerDaemon(pid, for: unit.id)
                         break
@@ -234,7 +265,7 @@ final class ProjectStore: ObservableObject {
             if !unit.endpoints.isEmpty {
                 phases[project.id] = "等待服务就绪 · \(unit.name)"
                 var ready = false
-                let deadline = Date().addingTimeInterval(120)
+                let deadline = Date().addingTimeInterval(AppConfiguration.serviceReadyTimeout)
                 while Date() < deadline {
                     try Task.checkCancellation()
                     await refresh()
@@ -250,6 +281,7 @@ final class ProjectStore: ObservableObject {
                 if command.exited { throw AppError.message("启动脚本已退出（\(command.exitCode ?? -1)）。若脚本会自行后台运行，请在配置中启用后台模式并填写 PID、停止命令。") }
             }
         }
+        if foundExternal { await refresh() }
     }
 
     func stop(_ project: Project, only: UUID? = nil, restart: Bool = false) {
@@ -276,15 +308,55 @@ final class ProjectStore: ObservableObject {
         operations[project.id] = operation
     }
 
-    private func stopUnits(_ project: Project, only: UUID?) async {
+    private func stopUnits(_ project: Project, only: UUID?, includeExternal: Bool = true) async {
         ownershipVersion += 1
         notices[project.id] = nil
         for unit in project.units.reversed() where only == nil || unit.id == only {
+            var outside: ProcessIdentity?
+            let supervised = Discovery.autoGameEntry(in: project.resolved(unit.directory), unit: unit) != nil
+            if supervised, (includeExternal && unit.enabled) || isManaged(unit) {
+                guard let snapshot = await System.processSnapshot() else {
+                    notices[project.id] = "无法核对 \(unit.name) 的进程，请稍后重试。"
+                    continue
+                }
+                var launchers = includeExternal && unit.enabled ? externalProcesses(project, unit, in: snapshot, excluding: managedRoots) : []
+                if let command = commands[unit.id], !command.exited {
+                    guard let root = ProcessIdentity(command.pid) else {
+                        notices[project.id] = "无法核对 \(unit.name) 的启动进程，请稍后重试。"
+                        continue
+                    }
+                    launchers.append(root)
+                }
+                if launchers.isEmpty, !snapshot.externalListeners(project, unit, projects: projects, excluding: managedRoots).isEmpty {
+                    notices[project.id] = "\(unit.name) 在外部监听，请使用原启动方式停止，再从 DevDock 启动。"
+                    continue
+                }
+                guard await System.stopExternal(launchers, in: snapshot, supervised: true) else {
+                    notices[project.id] = "\(unit.name) 仍在安全收尾，或无法确认唯一的启动器。未强制结束。"
+                    continue
+                }
+            } else if includeExternal, unit.enabled, !isManaged(unit) {
+                guard let snapshot = await System.processSnapshot() else {
+                    notices[project.id] = "无法核对 \(unit.name) 的进程，请稍后重试。"
+                    continue
+                }
+                let running = externalProcesses(project, unit, in: snapshot, excluding: managedRoots)
+                if running.isEmpty, !snapshot.externalListeners(project, unit, projects: projects, excluding: managedRoots).isEmpty {
+                    notices[project.id] = "\(unit.name) 在外部监听，请使用原启动方式停止，再从 DevDock 启动。"
+                    continue
+                }
+                if unit.detached {
+                    outside = running.first
+                } else if !running.isEmpty, !(await System.stopExternal(running, in: snapshot)) {
+                    notices[project.id] = "\(unit.name) 的外部进程尚未停止。"
+                    continue
+                }
+            }
             if unit.detached {
                 // Stop the launcher first, so it cannot create a daemon after cleanup.
                 if let command = commands[unit.id] { await command.stop() }
-                if let pid = ownedDetached[unit.id] ?? (commands[unit.id] != nil ? System.ownedPID(project: project, unit: unit) : nil) {
-                    if System.ownedPID(project: project, unit: unit) == pid {
+                if let pid = outside?.pid ?? ownedDetached[unit.id] ?? (commands[unit.id] != nil ? System.ownedPID(project: project, unit: unit) : nil) {
+                    if System.ownedPID(project: project, unit: unit) == pid, outside?.isAlive != false {
                         do {
                             let command = try RunningCommand(command: unit.stopCommand, directory: project.resolved(unit.directory), environment: environment ?? ProcessInfo.processInfo.environment,
                                 logURL: newLogURL(project, unit, suffix: "stop"), helperURL: helperURL)
@@ -293,20 +365,32 @@ final class ProjectStore: ObservableObject {
                                 try? await Task.sleep(nanoseconds: 100_000_000)
                             }
                             if !command.exited { await command.stop() }
-                            if System.ownedPID(project: project, unit: unit) == pid {
+                            if let outside {
+                                for _ in 0..<20 where outside.isAlive { try? await Task.sleep(nanoseconds: 100_000_000) }
+                            }
+                            if outside?.isAlive ?? (System.ownedPID(project: project, unit: unit) == pid) {
                                 notices[project.id] = "\(unit.name) 未能停止，请查看日志或使用项目停止命令。"
                                 continue
                             }
                         } catch { notices[project.id] = error.localizedDescription; continue }
+                    } else if outside?.isAlive == true {
+                        notices[project.id] = "\(unit.name) 的 PID 文件已变化，无法安全停止。"
+                        continue
                     }
                     ownedDetached[unit.id] = nil
                 }
-            } else if let command = commands[unit.id] { await command.stop() }
+            } else if !supervised, let command = commands[unit.id] { await command.stop() }
             commands[unit.id] = nil
+            external[unit.id] = nil
+            observedListeners[unit.id] = nil
             discoveredEndpoints[unit.id] = nil
             ownershipVersion += 1
         }
         await refresh()
+        if includeExternal, notices[project.id] == nil,
+           project.units.contains(where: { (only == nil || $0.id == only) && observedListeners[$0.id]?.isEmpty == false }) {
+            notices[project.id] = "仍有服务在外部监听，请使用原启动方式停止。"
+        }
     }
 
     func shutdown() async {
@@ -315,21 +399,38 @@ final class ProjectStore: ObservableObject {
         let pending = Array(operations.values)
         for operation in pending { operation.cancel() }
         for operation in pending { await operation.value }
-        for project in projects where isActive(project) { await stopUnits(project, only: nil) }
+        for project in projects where project.units.contains(where: isManaged) {
+            await stopUnits(project, only: nil, includeExternal: false)
+        }
     }
 
     func displayedEndpoints(_ unit: LaunchUnit) -> [Endpoint] {
         unit.endpoints + (discoveredEndpoints[unit.id] ?? [])
     }
 
+    func displayedServices(_ unit: LaunchUnit) -> [ServiceGroup] {
+        ServiceGroup.group(configured: unit.endpoints, discovered: discoveredEndpoints[unit.id] ?? [],
+                           activity: endpointActivity.filter { endpointStates[$0.key]?.isOwned == true })
+    }
+
     private func registerDaemon(_ pid: Int32, for unit: UUID) {
         if ownedDetached[unit] != pid { ownedDetached[unit] = pid; ownershipVersion += 1 }
     }
 
-    private func ownedPIDs(_ project: Project, _ unit: LaunchUnit, in snapshot: ProcessSnapshot) -> Set<Int32> {
+    private func externalProcesses(_ project: Project, _ unit: LaunchUnit, in snapshot: ProcessSnapshot, excluding roots: Set<Int32>) -> [ProcessIdentity] {
+        let found = snapshot.externalProcesses(project, unit, excluding: roots)
+        let stillRunning = (external[unit.id] ?? []).filter {
+            $0.isAlive && !roots.contains($0.pid) && !found.contains($0)
+        }
+        return (found + stillRunning).sorted { $0.pid < $1.pid }
+    }
+
+    private func ownedPIDs(_ project: Project, _ unit: LaunchUnit, in snapshot: ProcessSnapshot, external: [ProcessIdentity], observed: [ProcessIdentity]) -> Set<Int32> {
         let group = commands[unit.id].map(\.pid)
         let daemon = ownedDetached[unit.id].flatMap { System.ownedPID(project: project, unit: unit) == $0 ? $0 : nil }
-        return snapshot.ownedPIDs(group: group, daemon: daemon)
+        var pids = snapshot.ownedPIDs(group: group, daemon: daemon)
+        for run in external { pids.formUnion(snapshot.ownedPIDs(group: nil, daemon: run.pid)) }
+        return pids.union(observed.map(\.pid))
     }
 
     func refresh() async {
@@ -338,13 +439,20 @@ final class ProjectStore: ObservableObject {
         let version = ownershipVersion
         let scannedProjects = projects
         guard let before = await System.processSnapshot() else {
-            if ticket == refreshTicket { endpointStates = [:]; discoveredEndpoints = [:] }
+            if ticket == refreshTicket { endpointStates = [:]; endpointActivity = [:]; discoveredEndpoints = [:]; observedListeners = [:] }
             return
         }
+        var outside: [UUID: [ProcessIdentity]] = [:]
+        var observed: [UUID: [ProcessIdentity]] = [:]
         var probes: [Endpoint] = []
+        let roots = managedRoots
         for project in scannedProjects {
             for unit in project.enabledUnits {
-                let owned = ownedPIDs(project, unit, in: before)
+                let running = isManaged(unit) ? [] : externalProcesses(project, unit, in: before, excluding: roots)
+                if !running.isEmpty { outside[unit.id] = running }
+                let listening = before.externalListeners(project, unit, projects: scannedProjects, excluding: roots.union(running.map(\.pid)))
+                if !listening.isEmpty { observed[unit.id] = listening }
+                let owned = ownedPIDs(project, unit, in: before, external: running, observed: listening)
                 probes += unit.endpoints.filter { before.state(for: $0, owned: owned) == .listening }
             }
         }
@@ -355,17 +463,28 @@ final class ProjectStore: ObservableObject {
             return values
         }
         // Recheck ownership after HTTP: another process may have taken over the port meanwhile.
-        let finalSnapshot = await System.processSnapshot()
+        let finalSnapshot = probes.isEmpty ? before : await System.processSnapshot()
         guard ticket == refreshTicket, version == ownershipVersion, scannedProjects == projects else { return }
-        guard let after = finalSnapshot else { endpointStates = [:]; discoveredEndpoints = [:]; return }
+        guard let after = finalSnapshot else { endpointStates = [:]; endpointActivity = [:]; discoveredEndpoints = [:]; observedListeners = [:]; return }
         var states: [String: EndpointState] = [:]
+        var activity: [String: EndpointActivity] = [:]
         var discovered: [UUID: [Endpoint]] = [:]
+        func record(_ endpoint: Endpoint, owned: Set<Int32>, checkHTTP: Bool) {
+            let state = after.state(for: endpoint, owned: owned)
+            states[endpoint.id] = checkHTTP && state == .listening ? (responses[endpoint.id] == true ? .ready : .unready) : state
+            if state.isOwned { activity[endpoint.id] = after.activity(for: endpoint, owned: owned) }
+        }
         for project in scannedProjects {
             for unit in project.enabledUnits {
-                let owned = ownedPIDs(project, unit, in: after)
+                let running = probes.isEmpty ? (outside[unit.id] ?? []) :
+                    (isManaged(unit) ? [] : externalProcesses(project, unit, in: after, excluding: roots))
+                outside[unit.id] = running.isEmpty ? nil : running
+                let listening = probes.isEmpty ? (observed[unit.id] ?? []) :
+                    after.externalListeners(project, unit, projects: scannedProjects, excluding: roots.union(running.map(\.pid)))
+                observed[unit.id] = listening.isEmpty ? nil : listening
+                let owned = ownedPIDs(project, unit, in: after, external: running, observed: listening)
                 for endpoint in unit.endpoints {
-                    let state = after.state(for: endpoint, owned: owned)
-                    states[endpoint.id] = state == .listening ? (responses[endpoint.id] == true ? .ready : .unready) : state
+                    record(endpoint, owned: owned, checkHTTP: true)
                 }
                 var addresses = Set<String>()
                 for listener in after.listeners where owned.contains(listener.pid) {
@@ -375,12 +494,15 @@ final class ProjectStore: ObservableObject {
                     let endpoint = Endpoint(id: "runtime-\(unit.id)-\(url)", name: listener.name + " · 自动发现", url: url, healthURL: url)
                     discovered[unit.id, default: []].append(endpoint)
                     // Discovery proves a TCP listener, not that an unknown service is HTTP-ready.
-                    states[endpoint.id] = after.state(for: endpoint, owned: owned)
+                    record(endpoint, owned: owned, checkHTTP: false)
                 }
             }
         }
         if states != endpointStates { endpointStates = states }
+        if activity != endpointActivity { endpointActivity = activity }
         if discovered != discoveredEndpoints { discoveredEndpoints = discovered }
+        if outside != external { external = outside }
+        if observed != observedListeners { observedListeners = observed }
         for project in projects where !busy.contains(project.id) {
             for unit in project.units {
                 if let pid = ownedDetached[unit.id], System.ownedPID(project: project, unit: unit) != pid {
@@ -388,8 +510,14 @@ final class ProjectStore: ObservableObject {
                     ownershipVersion += 1
                     notices[project.id] = "\(unit.name) 的后台进程已退出，请查看日志。"
                 }
-                if let command = commands[unit.id], !unit.detached, command.exited, notices[project.id] == nil {
-                    notices[project.id] = "\(unit.name) 的脚本已退出（\(command.exitCode ?? -1)），请查看日志。"
+                if let command = commands[unit.id], !unit.detached, command.exited {
+                    if outside[unit.id] != nil || observed[unit.id] != nil {
+                        commands[unit.id] = nil
+                        ownershipVersion += 1
+                        if project.enabledUnits.count == 1 { notices[project.id] = nil }
+                    } else if notices[project.id] == nil {
+                        notices[project.id] = "\(unit.name) 的脚本已退出（\(command.exitCode ?? -1)），请查看日志。"
+                    }
                 }
                 if let message = commands[unit.id]?.sink.failure { notices[project.id] = "日志写入失败：\(message)" }
             }
@@ -401,7 +529,7 @@ final class ProjectStore: ObservableObject {
         let folder = logsURL.appendingPathComponent(project.id.uuidString).appendingPathComponent(unit.id.uuidString)
         if let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
             let batches = files.filter { $0.pathExtension == "log" }.sorted { $0.lastPathComponent > $1.lastPathComponent }
-            for old in batches.dropFirst(19) {
+            for old in batches.dropFirst(AppConfiguration.logRetentionCount - 1) {
                 try? FileManager.default.removeItem(at: old)
                 try? FileManager.default.removeItem(at: old.appendingPathExtension("previous"))
             }
@@ -428,5 +556,8 @@ final class ProjectStore: ObservableObject {
     }
 
     func startedAt(_ project: Project) -> Date? { project.units.compactMap { commands[$0.id]?.started }.min() }
-    func processID(_ unit: LaunchUnit) -> Int32? { ownedDetached[unit.id] ?? commands[unit.id].flatMap { $0.exited ? nil : $0.pid } }
+    func processID(_ unit: LaunchUnit) -> Int32? {
+        ownedDetached[unit.id] ?? commands[unit.id].flatMap { $0.exited ? nil : $0.pid }
+            ?? external[unit.id]?.first?.pid ?? observedListeners[unit.id]?.first?.pid
+    }
 }

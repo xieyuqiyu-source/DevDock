@@ -2,7 +2,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 swift build
-xcrun swiftc -swift-version 5 -parse-as-library \
-  Sources/DevDock/Models.swift Sources/DevDock/Runtime.swift Sources/DevDock/Store.swift \
+sources=()
+for source in Sources/DevDock/*.swift; do
+  if [[ "$source" != */App.swift ]]; then
+    sources+=("$source")
+  fi
+done
+xcrun swiftc -target "$(uname -m)-apple-macosx13.0" -swift-version 5 -parse-as-library "${sources[@]}" \
   Tests/DevDockTests/DevDockTests.swift -o .build/devdock-checks
 .build/devdock-checks

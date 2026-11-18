@@ -5,7 +5,64 @@ struct Endpoint: Codable, Identifiable, Equatable {
     var name: String
     var url: String
     var healthURL: String
-    var port: Int? { URL(string: url).map { $0.port ?? ($0.scheme == "https" ? 443 : 80) } }
+    var role: ServiceRole? = nil
+}
+
+enum ServiceRole: String, Codable, CaseIterable {
+    case frontend, backend, unclassified
+
+    var label: String {
+        switch self {
+        case .frontend: return "前端"
+        case .backend: return "后端"
+        case .unclassified: return "未分类"
+        }
+    }
+
+    static func fromName(_ name: String) -> Self? {
+        let words = name.lowercased().split { !$0.isASCII || !$0.isLetter }
+        let frontend = words.contains { ["frontend", "web", "ui"].contains($0) }
+            || ["前端", "网页", "控制台", "管理后台"].contains { name.contains($0) }
+            || name.lowercased() == "admin"
+        let backend = words.contains { ["backend", "api"].contains($0) }
+            || ["后端", "接口"].contains { name.contains($0) }
+        if frontend && backend { return .unclassified }
+        if frontend { return .frontend }
+        if backend { return .backend }
+        return nil
+    }
+}
+
+struct EndpointActivity: Equatable {
+    let pids: [Int32]
+    let inferredRole: ServiceRole?
+}
+
+struct ServiceGroup: Identifiable {
+    let id: String
+    let endpoints: [Endpoint]
+    let pids: [Int32]
+    let role: ServiceRole
+
+    static func group(configured: [Endpoint], discovered: [Endpoint], activity: [String: EndpointActivity]) -> [Self] {
+        enum Key: Hashable { case listening([Int32]), configured(String) }
+        func key(_ endpoint: Endpoint) -> Key {
+            if let current = activity[endpoint.id], !current.pids.isEmpty { return .listening(current.pids) }
+            return .configured(endpoint.id)
+        }
+        let endpoints = configured + discovered
+        let configuredIDs = Set(configured.map(\.id))
+        let grouped = Dictionary(grouping: endpoints, by: key)
+        var seen = Set<Key>()
+        return endpoints.compactMap { endpoint in
+            let identity = key(endpoint)
+            guard seen.insert(identity).inserted, let addresses = grouped[identity] else { return nil }
+            let named = Set(addresses.compactMap { configuredIDs.contains($0.id) ? ($0.role ?? ServiceRole.fromName($0.name)) : nil })
+            let roles = named.isEmpty ? Set(addresses.compactMap { activity[$0.id]?.inferredRole }) : named
+            return Self(id: endpoint.id, endpoints: addresses, pids: activity[endpoint.id]?.pids ?? [],
+                        role: roles.count == 1 ? roles.first ?? .unclassified : .unclassified)
+        }
+    }
 }
 
 enum EndpointState: Equatable {
@@ -101,74 +158,36 @@ struct Discovery {
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
-    static func project(at directory: URL) -> Project? {
-        let path = directory.standardizedFileURL.path
-        let dev = text(path, "dev")
-        let football = text(path, "dev.sh")
-        let hospital = text(path, "go-start")
-        if dev.contains("JUNMO_DEV_SKIP_INSTALL"), dev.contains("18110") {
-            return Project(name: directory.lastPathComponent, path: path, units: [
-                LaunchUnit(name: "前后端", command: "./dev", endpoints: [
-                    Endpoint(name: "Go API", url: "http://127.0.0.1:18110", healthURL: "http://127.0.0.1:18110/health"),
-                    Endpoint(name: "控制台", url: "http://127.0.0.1:15175", healthURL: "http://127.0.0.1:15175")
-                ])
-            ], note: "沿用 ./dev 的热更新和启动顺序；前后端日志为脚本的合并输出。")
-        }
-        if football.contains("com.football.local-agent"), football.contains("9802") {
-            return Project(name: directory.lastPathComponent, path: path, units: [
-                LaunchUnit(name: "API · Web · Admin", command: "./dev.sh", endpoints: [
-                    Endpoint(name: "Go API", url: "http://127.0.0.1:9800", healthURL: "http://127.0.0.1:9800/api/v1/home/summary"),
-                    Endpoint(name: "Web", url: "http://127.0.0.1:9801", healthURL: "http://127.0.0.1:9801"),
-                    Endpoint(name: "Admin", url: "http://127.0.0.1:9802", healthURL: "http://127.0.0.1:9802")
-                ])
-            ], note: "保留原脚本的启动顺序；三个端为合并日志。已运行的外部后端不由 DevDock 接管。")
-        }
-        if hospital.contains("start-bg"), hospital.contains("mini-api"), hospital.contains("admin-api") {
-            let apiUnits = [("mini", "小程序 API", 8071, "/health/ready"), ("admin", "管理 API", 8072, "/admin-api/health/ready")].map { key, title, port, health in
-                LaunchUnit(name: title, command: "./go-start start-bg \(key)", stopCommand: "./go-start stop \(key)",
-                           logFile: ".run/hospital-api/\(key)/\(key).log", pidFile: ".run/hospital-api/\(key)/\(key).pid",
-                           executable: ".run/hospital-api/\(key)/\(key)-api", detached: true,
-                           endpoints: [Endpoint(name: title, url: "http://127.0.0.1:\(port)", healthURL: "http://127.0.0.1:\(port)\(health)")])
-            }
-            var units = apiUnits
-            if hasDev(path, "apps/hospital-admin") {
-                units.append(LaunchUnit(name: "管理网页", directory: "apps/hospital-admin", command: "npm run dev -- --host 127.0.0.1 --port 5173 --strictPort", endpoints: [Endpoint(name: "管理网页", url: "http://127.0.0.1:5173", healthURL: "http://127.0.0.1:5173")]))
-            }
-            if hasDev(path, "apps/ot-demo-h5") {
-                units.append(LaunchUnit(name: "OT 演示", directory: "apps/ot-demo-h5", command: "corepack pnpm dev --host 127.0.0.1 --port 5174 --strictPort", enabled: false, endpoints: [Endpoint(name: "OT 演示", url: "http://127.0.0.1:5174/ot-demo/", healthURL: "http://127.0.0.1:5174/ot-demo/")]))
-            }
-            return Project(name: directory.lastPathComponent, path: path, units: units, note: "依次启动两个 API 和管理网页，OT 演示默认关闭。若 .env.local 改过端口，请在配置中调整服务地址。")
-        }
-        for entry in ["dev", "dev.sh", "start.sh", "go-start", "mac-start"] where !text(path, entry).isEmpty {
-            return Project(name: directory.lastPathComponent, path: path,
-                           units: [LaunchUnit(name: "项目", command: "./" + entry)],
-                           note: "已发现脚本。首次启动前检查命令；可配置服务地址、停止命令和日志来源。")
-        }
-        if hasDev(path, ".") {
-            let manager = FileManager.default.fileExists(atPath: path + "/pnpm-lock.yaml") ? "pnpm" : "npm run"
-            return Project(name: directory.lastPathComponent, path: path, units: [LaunchUnit(name: "开发服务", command: manager + " dev")], note: "从 package.json 的 scripts.dev 发现；服务地址可在配置中补充。")
-        }
-        return nil
+    static func autoGameEntry(in directory: String, unit: LaunchUnit) -> String? {
+        guard !unit.detached, unit.command.trimmingCharacters(in: .whitespacesAndNewlines) == "./dev",
+              text(directory, "dev").contains("scripts/serve.sh"),
+              text(directory, "scripts/serve.sh").contains("exec .venv/bin/python scripts/dev.py") else { return nil }
+        let entry = "scripts/dev.py"
+        let source = text(directory, entry)
+        return source.contains("AUTO_GAME_DATA") && source.contains("--supervise") && source.contains("server-feed/main.py") ? entry : nil
     }
 
-    static func hasDev(_ root: String, _ subdirectory: String) -> Bool {
-        let json = text(root, subdirectory + "/package.json")
-        guard let data = json.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let scripts = object["scripts"] as? [String: String] else { return false }
-        return scripts["dev"] != nil
+    static func project(at directory: URL) -> Project? {
+        return TemplateManager.shared.detect(at: directory.standardizedFileURL)
+    }
+
+    static func hasDev(_ root: String, _ subdirectory: String = ".") -> Bool {
+        guard let data = text(root, subdirectory + "/package.json").data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let scripts = object["scripts"] as? [String: Any],
+              let command = scripts["dev"] as? String else { return false }
+        return !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     // ponytail: bounded three-level discovery; add configurable depth only for deeper workspaces.
     static func scan(_ root: URL, depth: Int = 3) -> [Project] {
         var found: [Project] = []
-        if let project = project(at: root) { found.append(project) }
+        if let project = project(at: root) { return [project] }
         guard depth > 0, let children = try? FileManager.default.contentsOfDirectory(at: root,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { return found }
         for child in children.sorted(by: { $0.path < $1.path }) where !excluded.contains(child.lastPathComponent) {
             guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
                   values.isDirectory == true, values.isSymbolicLink != true else { continue }
-            // A detected project owns its nested packages; avoid duplicate API/front-end entries.
-            if found.first?.path == root.path { break }
             found += scan(child, depth: depth - 1)
         }
         return found

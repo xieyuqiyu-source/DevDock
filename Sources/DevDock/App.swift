@@ -5,6 +5,8 @@ import Combine
 @MainActor
 final class WindowSelection: ObservableObject {
     @Published var id: UUID?
+    @Published var logProject: UUID?
+    @Published var showUpdates = false
 }
 
 @MainActor
@@ -19,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var quitReady = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         let smoke = CommandLine.arguments.contains("--smoke-ui")
         let isolated = ProcessInfo.processInfo.environment["DEVDOCK_SUPPORT_DIR"].map { URL(fileURLWithPath: $0) }
         store = ProjectStore(support: isolated, seed: !smoke, monitor: !smoke)
@@ -38,13 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.toolTip = "DevDock · 项目启动器"
         }
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: MenuPanel(store: store, openProject: { [weak self] id in self?.showWindow(id) }, quit: { NSApp.terminate(nil) }))
+        popover.contentViewController = NSHostingController(rootView: MenuPanel(store: store, openProject: { [weak self] id, logs in self?.showWindow(id, logs: logs) }, checkUpdates: { [weak self] in self?.checkForUpdates() }, quit: { NSApp.terminate(nil) }))
         subscription = store.$revision.sink { [weak self] _ in
             guard let self else { return }
             self.statusItem.button?.title = self.store.activeCount > 0 ? " \(self.store.activeCount)" : ""
         }
         installMenu()
-        if smoke || CommandLine.arguments.contains("--show") { showWindow(nil) }
+        showWindow(nil)
         if smoke {
             Task {
                 store.launch(store.projects[0])
@@ -54,6 +56,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 await captureSmoke()
+                precondition(NSApp.activationPolicy() == .regular)
+                let managed = store.hasManagedServices
+                let close = NSApp.mainMenu?.items.compactMap(\.submenu).flatMap(\.items).first { $0.keyEquivalent == "w" }
+                precondition(close?.action == #selector(NSWindow.performClose(_:)))
+                window?.makeKeyAndOrderFront(nil)
+                precondition(NSApp.sendAction(#selector(NSWindow.performClose(_:)), to: window, from: close))
+                precondition(window?.isVisible == false)
+                precondition(store.hasManagedServices == managed)
+                _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
+                precondition(window?.isVisible == true)
+                print("PASS regular app activation, window close, service retention and reopen")
+                let appMenu = NSApp.mainMenu!.items[0].submenu!
+                let updateItem = appMenu.indexOfItem(withTarget: self, andAction: #selector(checkForUpdates))
+                precondition(updateItem >= 0)
+                appMenu.performActionForItem(at: updateItem)
+                for _ in 0..<50 where window?.attachedSheet == nil {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                precondition(selection.showUpdates && window?.attachedSheet != nil)
+                selection.showUpdates = false
+                print("PASS check-for-updates menu opens the update sheet")
                 NSApp.terminate(nil)
             }
         }
@@ -65,24 +88,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY); NSApp.activate(ignoringOtherApps: true) }
     }
 
-    func showWindow(_ id: UUID?) {
+    func showWindow(_ id: UUID?, logs: Bool = false) {
         popover.performClose(nil)
-        if let id { selection.id = id }
-        if window == nil {
+        if let id {
+            selection.id = id
+            if logs { selection.logProject = id }
+        }
+        let created = window == nil
+        if created {
             let root = WindowRoot(store: store, selection: selection)
             let controller = NSHostingController(rootView: root)
             let window = NSWindow(contentViewController: controller)
             window.title = "DevDock · 项目与日志"
-            window.setContentSize(NSSize(width: 1080, height: 740))
-            window.minSize = NSSize(width: 860, height: 590)
-            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.setContentSize(NSSize(width: 1120, height: 720))
+            window.minSize = NSSize(width: 900, height: 600)
             window.isReleasedWhenClosed = false
             window.center()
-            window.setFrameAutosaveName("DevDockMain")
+            if !CommandLine.arguments.contains("--smoke-ui") { window.setFrameAutosaveName("DevDockMain") }
             self.window = window
         }
         NSApp.activate(ignoringOtherApps: true)
+        if window?.isMiniaturized == true { window?.deminiaturize(nil) }
         window?.makeKeyAndOrderFront(nil)
+        if created { window?.makeFirstResponder(nil) }
     }
 
     private func installMenu() {
@@ -90,10 +121,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem()
         let app = NSMenu()
         app.addItem(withTitle: "项目与日志…", action: #selector(showMain), keyEquivalent: "0").target = self
+        app.addItem(withTitle: "检查更新…", action: #selector(checkForUpdates), keyEquivalent: "").target = self
         app.addItem(.separator())
         app.addItem(withTitle: "退出 DevDock", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = app
         main.addItem(item)
+        let file = NSMenuItem()
+        let fileMenu = NSMenu(title: "文件")
+        fileMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        file.submenu = fileMenu
+        main.addItem(file)
         let edit = NSMenuItem()
         let menu = NSMenu(title: "编辑")
         menu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
@@ -108,6 +145,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showMain() { showWindow(nil) }
 
+    @objc private func checkForUpdates() {
+        showWindow(nil)
+        selection.showUpdates = true
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showWindow(nil)
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard store != nil else { return .terminateNow }
         if quitReady { return .terminateNow }
@@ -115,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quitting = true
         Task {
             await store.shutdown()
-            if store.activeCount > 0 {
+            if store.hasManagedServices {
                 store.resumeAfterCancelledQuit()
                 store.error = "部分服务尚未停止，请处理后再次退出。"
                 quitting = false
@@ -133,10 +182,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func captureSmoke() async {
         guard let directory = ProcessInfo.processInfo.environment["DEVDOCK_SCREENSHOT_DIR"], let view = window?.contentView else { return }
         // Presentation-only fixtures; smoke mode never opens these URLs.
-        let links = [Endpoint(name: "前端页面（布局示例）", url: "http://localhost:15175", healthURL: "http://localhost:15175"),
-                     Endpoint(name: "管理后台（布局示例）", url: "http://localhost:15176/admin", healthURL: "http://localhost:15176")]
+        let links = [Endpoint(name: "Vite 页面（布局示例）", url: "http://localhost:15175", healthURL: "http://localhost:15175"),
+                     Endpoint(name: "Go API（布局示例）", url: "http://localhost:15176", healthURL: "http://localhost:15176")]
         store.discoveredEndpoints[store.projects[0].units[0].id] = links
         for link in links { store.endpointStates[link.id] = .listening }
+        store.endpointActivity[links[0].id] = EndpointActivity(pids: [31001], inferredRole: .frontend)
+        store.endpointActivity[links[1].id] = EndpointActivity(pids: [31002], inferredRole: .backend)
         func write(_ view: NSView, _ name: String) {
             view.layoutSubtreeIfNeeded()
             guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
@@ -146,10 +197,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for dark in [false, true] {
             let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
             window?.appearance = appearance
+            selection.id = nil
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            write(view, dark ? "dashboard-dark.png" : "dashboard.png")
+            selection.id = store.projects[0].id
             try? await Task.sleep(nanoseconds: 250_000_000)
             write(view, dark ? "window-dark.png" : "window.png")
-            let panel = NSHostingView(rootView: MenuPanel(store: store, openProject: { _ in }, quit: {}).environment(\.colorScheme, dark ? .dark : .light))
-            panel.frame = NSRect(x: 0, y: 0, width: 370, height: 400)
+            let panel = NSHostingView(rootView: MenuPanel(store: store, openProject: { _, _ in }, checkUpdates: {}, quit: {}).environment(\.colorScheme, dark ? .dark : .light))
+            panel.frame = NSRect(x: 0, y: 0, width: AppConfiguration.menuPanelWidth, height: 400)
             let host = NSWindow(contentRect: panel.frame, styleMask: [.borderless], backing: .buffered, defer: false)
             host.appearance = appearance
             host.contentView = panel
@@ -158,16 +213,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             write(panel, dark ? "menu-dark.png" : "menu.png")
         }
         window?.appearance = NSAppearance(named: .aqua)
-        window?.setContentSize(NSSize(width: 860, height: 590))
+        window?.setContentSize(NSSize(width: 900, height: 600))
         try? await Task.sleep(nanoseconds: 200_000_000)
         write(view, "window-compact.png")
+        selection.logProject = store.projects[0].id
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        write(view, "window-logs.png")
     }
 }
 
 struct WindowRoot: View {
     @ObservedObject var store: ProjectStore
     @ObservedObject var selection: WindowSelection
-    var body: some View { MainView(store: store, selected: $selection.id) }
+    var body: some View {
+        ModernMainView(store: store, selected: $selection.id, logProject: $selection.logProject)
+            .sheet(isPresented: $selection.showUpdates) { SoftwareUpdateView() }
+    }
 }
 
 @main
